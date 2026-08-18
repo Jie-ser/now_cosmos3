@@ -100,7 +100,24 @@ def parse_args():
     return parser.parse_args()
 
 
+def _disable_cosmos_guardrail():
+    """Mock cosmos_guardrail to avoid downloading gated Cosmos-1.0-Guardrail repo."""
+    import types
+    mock = types.ModuleType("cosmos_guardrail")
+
+    class _NoOpSafetyChecker:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, *args, **kwargs):
+            return args[0] if args else None
+
+    mock.CosmosSafetyChecker = _NoOpSafetyChecker
+    sys.modules.setdefault("cosmos_guardrail", mock)
+
+
 def load_cosmos3_pipeline(args):
+    _disable_cosmos_guardrail()
+
     from diffusers import Cosmos3OmniPipeline
     from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 
@@ -109,8 +126,8 @@ def load_cosmos3_pipeline(args):
         args.model,
         torch_dtype=torch.bfloat16,
         device_map="cuda",
-        safety_checker=None,
     )
+    pipe.safety_checker = None
     pipe.scheduler = UniPCMultistepScheduler.from_config(
         pipe.scheduler.config, flow_shift=args.flow_shift
     )
