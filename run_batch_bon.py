@@ -103,7 +103,10 @@ def parse_args():
 def _disable_cosmos_guardrail():
     """Mock cosmos_guardrail to avoid downloading gated Cosmos-1.0-Guardrail repo."""
     import types
+    import importlib.machinery
     mock = types.ModuleType("cosmos_guardrail")
+    mock.__spec__ = importlib.machinery.ModuleSpec("cosmos_guardrail", None)
+    mock.__version__ = "0.0.0"
 
     class _NoOpSafetyChecker:
         def __init__(self, *args, **kwargs):
@@ -112,7 +115,7 @@ def _disable_cosmos_guardrail():
             return args[0] if args else None
 
     mock.CosmosSafetyChecker = _NoOpSafetyChecker
-    sys.modules.setdefault("cosmos_guardrail", mock)
+    sys.modules["cosmos_guardrail"] = mock
 
 
 def load_cosmos3_pipeline(args):
