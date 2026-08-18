@@ -109,6 +109,7 @@ def load_cosmos3_pipeline(args):
         args.model,
         torch_dtype=torch.bfloat16,
         device_map="cuda",
+        safety_checker=None,
     )
     pipe.scheduler = UniPCMultistepScheduler.from_config(
         pipe.scheduler.config, flow_shift=args.flow_shift
