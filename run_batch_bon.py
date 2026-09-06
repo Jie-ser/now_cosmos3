@@ -97,6 +97,35 @@ def parse_args():
     parser.add_argument("--resume", action="store_true",
                         help="Skip cases that already have output directories.")
 
+    # --- Advanced BoN modes ---
+    parser.add_argument("--progressive", action="store_true",
+                        help="Enable progressive elimination BoN.")
+    parser.add_argument("--tree_branching", action="store_true",
+                        help="Enable tree branching BoN.")
+    parser.add_argument("--guidance", action="store_true",
+                        help="Enable gradient guidance (requires tree_branching + multi-GPU).")
+
+    # Progressive elimination params
+    parser.add_argument("--sigma_checkpoints", nargs="+", type=float,
+                        default=[0.83, 0.63])
+    parser.add_argument("--elimination_ratio", type=float, default=0.5)
+    parser.add_argument("--min_survivors", type=int, default=2)
+    parser.add_argument("--score_epsilon", type=float, default=0.02)
+    parser.add_argument("--early_max_frames", type=int, default=12)
+
+    # Tree branching params
+    parser.add_argument("--num_trunks", type=int, default=2)
+    parser.add_argument("--branches_per_trunk", type=int, default=4)
+    parser.add_argument("--branch_sigma", type=float, default=0.90)
+    parser.add_argument("--branch_eta", type=float, default=0.10)
+
+    # Gradient guidance params
+    parser.add_argument("--geo_guidance_scale", type=float, default=0.001)
+    parser.add_argument("--geo_guidance_frequency", type=int, default=5)
+    parser.add_argument("--geo_guidance_sigma_min", type=float, default=0.08)
+    parser.add_argument("--geo_guidance_sigma_max", type=float, default=0.83)
+    parser.add_argument("--guidance_frames", type=int, default=8)
+
     return parser.parse_args()
 
 
@@ -125,11 +154,24 @@ def load_cosmos3_pipeline(args):
     from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 
     logger.info(f"Loading Cosmos3 pipeline from: {args.model}")
-    pipe = Cosmos3OmniPipeline.from_pretrained(
-        args.model,
-        torch_dtype=torch.bfloat16,
-        device_map="cuda",
+
+    needs_manual_offload = getattr(args, "progressive", False) or getattr(
+        args, "tree_branching", False
     )
+
+    if needs_manual_offload:
+        pipe = Cosmos3OmniPipeline.from_pretrained(
+            args.model,
+            torch_dtype=torch.bfloat16,
+        )
+        pipe = pipe.to("cuda")
+    else:
+        pipe = Cosmos3OmniPipeline.from_pretrained(
+            args.model,
+            torch_dtype=torch.bfloat16,
+            device_map="cuda",
+        )
+
     pipe.safety_checker = None
     pipe.scheduler = UniPCMultistepScheduler.from_config(
         pipe.scheduler.config, flow_shift=args.flow_shift
@@ -178,13 +220,118 @@ def main():
 
     pipe = load_cosmos3_pipeline(args)
 
-    from geo_reward.bon_pipeline import Cosmos3GeoRewardBoN
-    bon = Cosmos3GeoRewardBoN(
-        pipe=pipe,
-        recon_reward=recon_reward,
-        max_frames=args.max_frames,
-        offload=args.offload,
-    )
+    # Validate guidance compatibility
+    if args.guidance and args.progressive and not args.tree_branching:
+        logger.warning(
+            "--guidance incompatible with progressive (without --tree_branching). "
+            "Ignoring --guidance."
+        )
+        args.guidance = False
+
+    if args.guidance and args.tree_branching:
+        if "--geo_guidance_frequency" not in sys.argv:
+            args.geo_guidance_frequency = 3
+        if "--geo_guidance_sigma_max" not in sys.argv:
+            args.geo_guidance_sigma_max = 0.83
+
+    # Build the appropriate BoN pipeline
+    use_advanced = args.progressive or args.tree_branching
+
+    if use_advanced:
+        from geo_reward.cosmos3_adapter import Cosmos3ProgressiveAdapter
+        adapter = Cosmos3ProgressiveAdapter(pipe)
+
+        adapter_kwargs = dict(
+            num_frames=args.num_frames,
+            height=args.height,
+            width=args.width,
+            fps=args.fps,
+            num_inference_steps=args.num_inference_steps,
+            cfg_scale=args.guidance_scale,
+            negative_prompt=args.negative_prompt,
+        )
+
+        if args.tree_branching and args.guidance:
+            from geo_reward.guidance import GeometricGuidance
+            from geo_reward.bon_pipeline import Cosmos3GeoRewardBoNTreeBranchingGuided
+
+            guidance_cfg = ReconRewardConfig(
+                static_weight=cfg.static_weight,
+                dynamic_weight=cfg.dynamic_weight,
+                motion_weight=cfg.motion_weight,
+                dynamic_threshold_ratio=cfg.dynamic_threshold_ratio,
+                tau_reproj=cfg.tau_reproj,
+                occlusion_margin=cfg.occlusion_margin,
+                tau_accel=cfg.tau_accel,
+                tau_speed=cfg.tau_speed,
+                max_sample_pixels=cfg.max_sample_pixels,
+                tau_cam=cfg.tau_cam,
+                tau_rot=cfg.tau_rot,
+                min_motion=cfg.min_motion,
+                tau_motion=cfg.tau_motion,
+                conf_valid_quantile=cfg.conf_valid_quantile,
+                max_frames=cfg.max_frames,
+                image_size=cfg.image_size,
+                geo_guidance_scale=args.geo_guidance_scale,
+                geo_guidance_frequency=args.geo_guidance_frequency,
+                sigma_min=args.geo_guidance_sigma_min,
+                sigma_max=args.geo_guidance_sigma_max,
+            )
+
+            guidance = GeometricGuidance(
+                model_4rc=fourrc_model,
+                vae=pipe.vae,
+                cfg=guidance_cfg,
+                guidance_frames=args.guidance_frames,
+                vae_latents_mean=pipe._vae_latents_mean,
+                vae_latents_inv_std=pipe._vae_latents_inv_std,
+            )
+            bon = Cosmos3GeoRewardBoNTreeBranchingGuided(
+                adapter=adapter, recon_reward=recon_reward, guidance=guidance,
+                num_trunks=args.num_trunks, branches_per_trunk=args.branches_per_trunk,
+                branch_sigma=args.branch_sigma, branch_eta=args.branch_eta,
+                max_frames=args.max_frames, sigma_checkpoints=args.sigma_checkpoints,
+                elimination_ratio=args.elimination_ratio,
+                min_survivors=args.min_survivors,
+                score_epsilon=args.score_epsilon,
+                early_max_frames=args.early_max_frames,
+                offload_models=args.offload,
+            )
+            effective_N = args.num_trunks * args.branches_per_trunk
+        elif args.tree_branching:
+            from geo_reward.bon_pipeline import Cosmos3GeoRewardBoNTreeBranching
+            bon = Cosmos3GeoRewardBoNTreeBranching(
+                adapter=adapter, recon_reward=recon_reward,
+                num_trunks=args.num_trunks, branches_per_trunk=args.branches_per_trunk,
+                branch_sigma=args.branch_sigma, branch_eta=args.branch_eta,
+                max_frames=args.max_frames, sigma_checkpoints=args.sigma_checkpoints,
+                elimination_ratio=args.elimination_ratio,
+                min_survivors=args.min_survivors,
+                score_epsilon=args.score_epsilon,
+                early_max_frames=args.early_max_frames,
+                offload_models=args.offload,
+            )
+            effective_N = args.num_trunks * args.branches_per_trunk
+        else:
+            from geo_reward.bon_pipeline import Cosmos3GeoRewardBoNProgressiveV2
+            bon = Cosmos3GeoRewardBoNProgressiveV2(
+                adapter=adapter, recon_reward=recon_reward,
+                max_frames=args.max_frames, sigma_checkpoints=args.sigma_checkpoints,
+                elimination_ratio=args.elimination_ratio,
+                min_survivors=args.min_survivors,
+                score_epsilon=args.score_epsilon,
+                early_max_frames=args.early_max_frames,
+                offload_models=args.offload,
+            )
+            effective_N = args.N
+    else:
+        from geo_reward.bon_pipeline import Cosmos3GeoRewardBoN
+        bon = Cosmos3GeoRewardBoN(
+            pipe=pipe,
+            recon_reward=recon_reward,
+            max_frames=args.max_frames,
+            offload=args.offload,
+        )
 
     # Run batch
     all_results = []
@@ -214,47 +361,73 @@ def main():
 
         t0 = time.time()
         try:
-            best_frames, rewards, best_idx = bon.generate(
-                prompt=prompt,
-                image=img,
-                N=args.N,
-                num_frames=args.num_frames,
-                fps=args.fps,
-                seed_base=args.seed_base,
-                save_all=True,
-                output_dir=case_dir,
-                height=args.height,
-                width=args.width,
-                guidance_scale=args.guidance_scale,
-                num_inference_steps=args.num_inference_steps,
-                negative_prompt=args.negative_prompt,
-            )
-            elapsed = time.time() - t0
+            if use_advanced:
+                best_frames, result_log, best_seed = bon.generate(
+                    prompt=prompt,
+                    image=img,
+                    N=effective_N,
+                    seed_base=args.seed_base,
+                    output_dir=case_dir,
+                    **adapter_kwargs,
+                )
+                elapsed = time.time() - t0
 
-            result = {
-                "image_stem": image_stem,
-                "prompt": prompt,
-                "best_index": best_idx,
-                "best_seed": args.seed_base + best_idx,
-                "best_reward": rewards[best_idx]["total"],
-                "time_sec": elapsed,
-                "candidates": [
-                    {"index": i, "reward": r, "is_best": i == best_idx}
-                    for i, r in enumerate(rewards)
-                ],
-            }
+                result = {
+                    "image_stem": image_stem,
+                    "prompt": prompt,
+                    "best_seed": best_seed,
+                    "time_sec": elapsed,
+                    **{k: v for k, v in result_log.items()
+                       if k not in ("prompt", "image")},
+                }
+            else:
+                best_frames, rewards, best_idx = bon.generate(
+                    prompt=prompt,
+                    image=img,
+                    N=args.N,
+                    num_frames=args.num_frames,
+                    fps=args.fps,
+                    seed_base=args.seed_base,
+                    save_all=True,
+                    output_dir=case_dir,
+                    height=args.height,
+                    width=args.width,
+                    guidance_scale=args.guidance_scale,
+                    num_inference_steps=args.num_inference_steps,
+                    negative_prompt=args.negative_prompt,
+                )
+                elapsed = time.time() - t0
+
+                result = {
+                    "image_stem": image_stem,
+                    "prompt": prompt,
+                    "best_index": best_idx,
+                    "best_seed": args.seed_base + best_idx,
+                    "best_reward": rewards[best_idx]["total"],
+                    "time_sec": elapsed,
+                    "candidates": [
+                        {"index": i, "reward": r, "is_best": i == best_idx}
+                        for i, r in enumerate(rewards)
+                    ],
+                }
             all_results.append(result)
 
             # Save per-case results
             with open(os.path.join(case_dir, "rewards.json"), "w", encoding="utf-8") as f:
                 json.dump(result, f, indent=2, ensure_ascii=False)
 
-            logger.info(
-                f"  => Best: candidate {best_idx+1}/{args.N} "
-                f"(seed={args.seed_base + best_idx}, "
-                f"reward={rewards[best_idx]['total']:.4f}), "
-                f"time={elapsed:.1f}s"
-            )
+            if use_advanced:
+                logger.info(
+                    f"  => Best: seed_{result['best_seed']} "
+                    f"time={elapsed:.1f}s"
+                )
+            else:
+                logger.info(
+                    f"  => Best: candidate {best_idx+1}/{args.N} "
+                    f"(seed={args.seed_base + best_idx}, "
+                    f"reward={rewards[best_idx]['total']:.4f}), "
+                    f"time={elapsed:.1f}s"
+                )
 
         except Exception as e:
             logger.error(f"  ERROR processing {image_stem}: {e}")

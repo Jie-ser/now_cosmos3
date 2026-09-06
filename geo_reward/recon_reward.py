@@ -61,6 +61,12 @@ class ReconRewardConfig:
     max_frames: int = 20
     image_size: int = 518
 
+    # Gradient guidance parameters
+    geo_guidance_scale: float = 0.001
+    geo_guidance_frequency: int = 5
+    sigma_min: float = 0.08
+    sigma_max: float = 0.83
+
 
 class ReconstructionReward:
     """
@@ -383,3 +389,114 @@ class ReconstructionReward:
             for i in range(N - stride):
                 pairs.append((i, i + stride))
         return pairs
+
+    def compute_differentiable_loss(self, raw_output, valid_mask, dynamic_mask, scene_scale):
+        """
+        Compute differentiable geometric loss for gradient guidance.
+
+        This function is designed to be called within a gradient-enabled context.
+        conf is detached as valid_mask -- we never backprop through confidence.
+
+        Args:
+            raw_output: Dict from 4RC forward pass (pts, track, extrinsic, intrinsic).
+            valid_mask: (N, H, W) detached bool mask from conf.
+            dynamic_mask: (H, W) detached bool mask from track.
+            scene_scale: Float.
+
+        Returns:
+            Scalar loss tensor (differentiable).
+        """
+        pts = raw_output["pts"]
+        track = raw_output["track"]
+        extrinsics = raw_output["extrinsic"]
+        intrinsics = raw_output["intrinsic"]
+        static_mask = ~dynamic_mask
+
+        l_reproj = self._differentiable_reproj_loss(
+            pts, extrinsics, intrinsics, static_mask, valid_mask, scene_scale
+        )
+        l_smooth = self._differentiable_track_smoothness(
+            track, dynamic_mask, valid_mask, scene_scale
+        )
+        l_anchor = self._differentiable_anchor_loss(pts, static_mask, extrinsics[0])
+
+        loss = l_reproj + 0.5 * l_smooth + 0.3 * l_anchor
+        return loss
+
+    def _differentiable_reproj_loss(self, pts, extrinsics, intrinsics,
+                                     static_mask, valid_mask, scene_scale):
+        """Differentiable reprojection loss for gradient guidance."""
+        N, H, W, _ = pts.shape
+        losses = []
+
+        for i in range(0, min(N - 1, 3)):
+            j = i + 1
+            mask = static_mask & valid_mask[i] & valid_mask[j]
+            if mask.sum() < 100:
+                continue
+
+            pts_i = pts[i][mask]
+            w2c_j = torch.linalg.inv(extrinsics[j])
+            pts_i_homo = F.pad(pts_i, (0, 1), value=1.0)
+            pts_in_j = (w2c_j @ pts_i_homo.T).T[:, :3]
+            proj_depth = pts_in_j[:, 2]
+
+            pts_j = pts[j][mask]
+            pts_j_homo = F.pad(pts_j, (0, 1), value=1.0)
+            pts_j_cam = (w2c_j @ pts_j_homo.T).T[:, 2]
+
+            valid = (proj_depth > 0.01) & (pts_j_cam > 0.01)
+            if valid.sum() < 50:
+                continue
+
+            log_err = (torch.log(proj_depth[valid] + 1e-8) -
+                       torch.log(pts_j_cam[valid] + 1e-8)).abs()
+            losses.append(log_err.mean())
+
+        if not losses:
+            return torch.tensor(0.0, device=pts.device, requires_grad=True)
+        return torch.stack(losses).mean()
+
+    def _differentiable_track_smoothness(self, track, dynamic_mask, valid_mask, scene_scale):
+        """Differentiable track smoothness loss for gradient guidance."""
+        N, H, W, _ = track.shape
+        if N < 3:
+            return torch.tensor(0.0, device=track.device, requires_grad=True)
+
+        all_valid = valid_mask.all(dim=0) & dynamic_mask
+        if all_valid.sum() < 10:
+            return torch.tensor(0.0, device=track.device, requires_grad=True)
+
+        K = min(500, all_valid.sum().item())
+        indices = all_valid.nonzero()[:K]
+        traj = track[:, indices[:, 0], indices[:, 1], :]  # (N, K, 3)
+
+        accel = traj[2:] - 2 * traj[1:-1] + traj[:-2]
+        return (torch.norm(accel, dim=-1) / scene_scale).mean()
+
+    def _differentiable_anchor_loss(self, pts, static_mask, extrinsic_frame0=None):
+        """Differentiable anchor loss: depth consistency of first frame in camera coords."""
+        pts_frame0 = pts[0]  # (H, W, 3)
+
+        if extrinsic_frame0 is not None:
+            w2c = torch.linalg.inv(extrinsic_frame0)
+            H, W = pts_frame0.shape[:2]
+            pts_flat = pts_frame0.reshape(-1, 3)
+            pts_homo = torch.cat([pts_flat, torch.ones_like(pts_flat[:, :1])], dim=-1)
+            pts_cam = (w2c @ pts_homo.T).T[:, :3].reshape(H, W, 3)
+            depth0 = pts_cam[..., 2]
+        else:
+            depth0 = pts_frame0[..., 2]
+
+        if static_mask.sum() < 50:
+            return torch.tensor(0.0, device=pts.device, requires_grad=True)
+
+        static_depth = depth0[static_mask]
+        valid = static_depth > 0.01
+        if valid.sum() < 50:
+            return torch.tensor(0.0, device=pts.device, requires_grad=True)
+
+        depths = static_depth[valid]
+        median_d = depths.median().detach()
+        deviation = (torch.log(depths + 1e-8) - torch.log(median_d + 1e-8)).abs()
+        return deviation.mean()

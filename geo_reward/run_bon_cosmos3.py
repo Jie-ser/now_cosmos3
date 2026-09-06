@@ -111,12 +111,44 @@ def parse_args():
     # Output
     parser.add_argument("--output_dir", type=str, default="outputs/geo_reward_bon_cosmos3")
 
+    # --- Advanced BoN modes ---
+    parser.add_argument("--progressive", action="store_true",
+                        help="Enable progressive elimination BoN.")
+    parser.add_argument("--tree_branching", action="store_true",
+                        help="Enable tree branching BoN.")
+    parser.add_argument("--guidance", action="store_true",
+                        help="Enable gradient guidance (requires tree_branching + multi-GPU).")
+
+    # Progressive elimination params
+    parser.add_argument("--sigma_checkpoints", nargs="+", type=float,
+                        default=[0.83, 0.63])
+    parser.add_argument("--elimination_ratio", type=float, default=0.5)
+    parser.add_argument("--min_survivors", type=int, default=2)
+    parser.add_argument("--score_epsilon", type=float, default=0.02)
+    parser.add_argument("--early_max_frames", type=int, default=12)
+
+    # Tree branching params
+    parser.add_argument("--num_trunks", type=int, default=2)
+    parser.add_argument("--branches_per_trunk", type=int, default=4)
+    parser.add_argument("--branch_sigma", type=float, default=0.90)
+    parser.add_argument("--branch_eta", type=float, default=0.10)
+
+    # Gradient guidance params (geo_ prefix to avoid conflict with CFG --guidance_scale)
+    parser.add_argument("--geo_guidance_scale", type=float, default=0.001,
+                        help="Geometric guidance strength (NOT CFG scale).")
+    parser.add_argument("--geo_guidance_frequency", type=int, default=5,
+                        help="Apply guidance every N-th denoising step.")
+    parser.add_argument("--geo_guidance_sigma_min", type=float, default=0.08)
+    parser.add_argument("--geo_guidance_sigma_max", type=float, default=0.83,
+                        help="Max sigma for guidance window (0.83 = after first elimination).")
+    parser.add_argument("--guidance_frames", type=int, default=8)
+
     return parser.parse_args()
 
 
 def build_recon_config(args):
     from .recon_reward import ReconRewardConfig
-    return ReconRewardConfig(
+    kwargs = dict(
         static_weight=args.static_weight,
         dynamic_weight=args.dynamic_weight,
         motion_weight=args.motion_weight,
@@ -134,6 +166,14 @@ def build_recon_config(args):
         max_frames=args.max_frames,
         image_size=args.image_size,
     )
+    if hasattr(args, "geo_guidance_scale"):
+        kwargs.update(
+            geo_guidance_scale=args.geo_guidance_scale,
+            geo_guidance_frequency=args.geo_guidance_frequency,
+            sigma_min=args.geo_guidance_sigma_min,
+            sigma_max=args.geo_guidance_sigma_max,
+        )
+    return ReconRewardConfig(**kwargs)
 
 
 def load_4rc_model(model_path, device="cpu"):
@@ -149,16 +189,34 @@ def load_4rc_model(model_path, device="cpu"):
 
 
 def load_cosmos3_pipeline(args):
-    """Load Cosmos3 Diffusers pipeline."""
+    """Load Cosmos3 Diffusers pipeline.
+
+    For progressive / tree_branching modes, uses device_map=None so that
+    manual model offloading works correctly (device_map="cuda" installs
+    accelerate dispatch hooks that conflict with manual .to() calls).
+    """
     from diffusers import Cosmos3OmniPipeline
     from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 
     logger.info(f"Loading Cosmos3 pipeline from: {args.model}")
-    pipe = Cosmos3OmniPipeline.from_pretrained(
-        args.model,
-        torch_dtype=torch.bfloat16,
-        device_map="cuda",
+
+    needs_manual_offload = getattr(args, "progressive", False) or getattr(
+        args, "tree_branching", False
     )
+
+    if needs_manual_offload:
+        pipe = Cosmos3OmniPipeline.from_pretrained(
+            args.model,
+            torch_dtype=torch.bfloat16,
+        )
+        pipe = pipe.to("cuda")
+    else:
+        pipe = Cosmos3OmniPipeline.from_pretrained(
+            args.model,
+            torch_dtype=torch.bfloat16,
+            device_map="cuda",
+        )
+
     pipe.scheduler = UniPCMultistepScheduler.from_config(
         pipe.scheduler.config, flow_shift=args.flow_shift
     )
@@ -172,7 +230,25 @@ def run_bon(args):
 
     cfg = build_recon_config(args)
 
-    # Load 4RC (start on CPU if offloading, otherwise GPU)
+    # Validate guidance compatibility (matches now project logic)
+    if args.guidance and args.progressive and not args.tree_branching:
+        logger.warning(
+            "--guidance is incompatible with progressive elimination "
+            "(without --tree_branching). Gradient guidance only works with "
+            "tree_branching or sequential BoN. Ignoring --guidance flag."
+        )
+        args.guidance = False
+
+    # Tree_branching + guidance: auto-adjust defaults
+    if args.guidance and args.tree_branching:
+        if "--geo_guidance_frequency" not in sys.argv:
+            args.geo_guidance_frequency = 3
+            cfg.geo_guidance_frequency = 3
+        if "--geo_guidance_sigma_max" not in sys.argv:
+            args.geo_guidance_sigma_max = 0.83
+            cfg.sigma_max = 0.83
+
+    # Load 4RC
     fourrc_device = "cpu" if args.offload else "cuda"
     fourrc_model = load_4rc_model(args.fourrc_model, device=fourrc_device)
 
@@ -195,67 +271,221 @@ def run_bon(args):
     case_dir = os.path.join(args.output_dir, f"{image_stem}_{timestamp}")
     os.makedirs(case_dir, exist_ok=True)
 
-    # Build BoN pipeline
-    from .bon_pipeline import Cosmos3GeoRewardBoN
-    bon = Cosmos3GeoRewardBoN(
-        pipe=pipe,
-        recon_reward=recon_reward,
-        max_frames=args.max_frames,
-        offload=args.offload,
-    )
-
-    # Run BoN
-    t0 = time.time()
-    best_frames, rewards, best_idx = bon.generate(
-        prompt=args.prompt,
-        image=img,
-        N=args.N,
+    # Shared adapter kwargs for progressive modes
+    adapter_kwargs = dict(
         num_frames=args.num_frames,
-        fps=args.fps,
-        seed_base=args.seed_base,
-        save_all=args.save_all,
-        output_dir=case_dir,
         height=args.height,
         width=args.width,
-        guidance_scale=args.guidance_scale,
+        fps=args.fps,
         num_inference_steps=args.num_inference_steps,
+        cfg_scale=args.guidance_scale,
         negative_prompt=args.negative_prompt,
     )
+
+    t0 = time.time()
+
+    if args.tree_branching and args.guidance:
+        # --- Tree Branching + Gradient Guidance ---
+        # Requires multi-GPU: transformer stays on GPU0, VAE+4RC on other GPUs.
+        # With fewer than 3 GPUs, fall back to offload mode with a warning.
+        from .cosmos3_adapter import Cosmos3ProgressiveAdapter
+        from .guidance import GeometricGuidance
+        from .bon_pipeline import Cosmos3GeoRewardBoNTreeBranchingGuided
+
+        num_gpus = torch.cuda.device_count()
+        if num_gpus < 2:
+            logger.warning(
+                "Gradient guidance with single GPU is likely to OOM. "
+                "Consider using --tree_branching without --guidance, "
+                "or use a multi-GPU setup (>= 3 GPUs recommended, 4 ideal)."
+            )
+            vae_device = None
+            fourrc_device = None
+        elif num_gpus < 4:
+            logger.info(
+                f"Detected {num_gpus} GPUs. Guidance in reduced multi-GPU mode: "
+                f"transformer=cuda:0, VAE+4RC=cuda:{num_gpus - 1}."
+            )
+            vae_device = f"cuda:{num_gpus - 1}"
+            fourrc_device = f"cuda:{num_gpus - 1}"
+        else:
+            logger.info(
+                f"Detected {num_gpus} GPUs. Guidance in 4-GPU resident mode: "
+                f"transformer=cuda:0, VAE=cuda:1, 4RC=cuda:2."
+            )
+            vae_device = "cuda:1"
+            fourrc_device = "cuda:2"
+
+        adapter = Cosmos3ProgressiveAdapter(pipe)
+        guidance = GeometricGuidance(
+            model_4rc=fourrc_model,
+            vae=pipe.vae,
+            cfg=cfg,
+            guidance_frames=args.guidance_frames,
+            vae_latents_mean=pipe._vae_latents_mean,
+            vae_latents_inv_std=pipe._vae_latents_inv_std,
+            vae_device=vae_device,
+            fourrc_device=fourrc_device,
+        )
+
+        # In multi-GPU resident mode, no offload needed during guidance steps.
+        # In single-GPU mode, offload_models=True handles DiT↔4RC swapping.
+        use_offload = args.offload or (num_gpus < 2)
+
+        bon = Cosmos3GeoRewardBoNTreeBranchingGuided(
+            adapter=adapter,
+            recon_reward=recon_reward,
+            guidance=guidance,
+            num_trunks=args.num_trunks,
+            branches_per_trunk=args.branches_per_trunk,
+            branch_sigma=args.branch_sigma,
+            branch_eta=args.branch_eta,
+            max_frames=args.max_frames,
+            sigma_checkpoints=args.sigma_checkpoints,
+            elimination_ratio=args.elimination_ratio,
+            min_survivors=args.min_survivors,
+            score_epsilon=args.score_epsilon,
+            early_max_frames=args.early_max_frames,
+            offload_models=use_offload,
+        )
+        N = args.num_trunks * args.branches_per_trunk
+        best_frames, result_log, best_seed = bon.generate(
+            prompt=args.prompt,
+            image=img,
+            N=N,
+            seed_base=args.seed_base,
+            output_dir=case_dir,
+            **adapter_kwargs,
+        )
+        rewards = result_log
+
+    elif args.tree_branching:
+        # --- Tree Branching ---
+        from .cosmos3_adapter import Cosmos3ProgressiveAdapter
+        from .bon_pipeline import Cosmos3GeoRewardBoNTreeBranching
+
+        adapter = Cosmos3ProgressiveAdapter(pipe)
+        bon = Cosmos3GeoRewardBoNTreeBranching(
+            adapter=adapter,
+            recon_reward=recon_reward,
+            num_trunks=args.num_trunks,
+            branches_per_trunk=args.branches_per_trunk,
+            branch_sigma=args.branch_sigma,
+            branch_eta=args.branch_eta,
+            max_frames=args.max_frames,
+            sigma_checkpoints=args.sigma_checkpoints,
+            elimination_ratio=args.elimination_ratio,
+            min_survivors=args.min_survivors,
+            score_epsilon=args.score_epsilon,
+            early_max_frames=args.early_max_frames,
+            offload_models=args.offload,
+        )
+        N = args.num_trunks * args.branches_per_trunk
+        best_frames, result_log, best_seed = bon.generate(
+            prompt=args.prompt,
+            image=img,
+            N=N,
+            seed_base=args.seed_base,
+            output_dir=case_dir,
+            **adapter_kwargs,
+        )
+        rewards = result_log
+
+    elif args.progressive:
+        # --- Progressive Elimination ---
+        from .cosmos3_adapter import Cosmos3ProgressiveAdapter
+        from .bon_pipeline import Cosmos3GeoRewardBoNProgressiveV2
+
+        adapter = Cosmos3ProgressiveAdapter(pipe)
+        bon = Cosmos3GeoRewardBoNProgressiveV2(
+            adapter=adapter,
+            recon_reward=recon_reward,
+            max_frames=args.max_frames,
+            sigma_checkpoints=args.sigma_checkpoints,
+            elimination_ratio=args.elimination_ratio,
+            min_survivors=args.min_survivors,
+            score_epsilon=args.score_epsilon,
+            early_max_frames=args.early_max_frames,
+            offload_models=args.offload,
+        )
+        best_frames, result_log, best_seed = bon.generate(
+            prompt=args.prompt,
+            image=img,
+            N=args.N,
+            seed_base=args.seed_base,
+            output_dir=case_dir,
+            **adapter_kwargs,
+        )
+        rewards = result_log
+
+    else:
+        # --- Default: basic sequential BoN (backward compatible) ---
+        from .bon_pipeline import Cosmos3GeoRewardBoN
+        bon = Cosmos3GeoRewardBoN(
+            pipe=pipe,
+            recon_reward=recon_reward,
+            max_frames=args.max_frames,
+            offload=args.offload,
+        )
+        best_frames, rewards, best_idx = bon.generate(
+            prompt=args.prompt,
+            image=img,
+            N=args.N,
+            num_frames=args.num_frames,
+            fps=args.fps,
+            seed_base=args.seed_base,
+            save_all=args.save_all,
+            output_dir=case_dir,
+            height=args.height,
+            width=args.width,
+            guidance_scale=args.guidance_scale,
+            num_inference_steps=args.num_inference_steps,
+            negative_prompt=args.negative_prompt,
+        )
+        best_seed = args.seed_base + best_idx if args.seed_base is not None else None
+
     total_time = time.time() - t0
 
     # Save results log
-    results = {
-        "mode": "bon",
-        "prompt": args.prompt,
-        "image": os.path.abspath(args.image),
-        "N": args.N,
-        "best_index": best_idx,
-        "best_seed": args.seed_base + best_idx if args.seed_base is not None else None,
-        "best_reward": rewards[best_idx]["total"],
-        "total_time_sec": total_time,
-        "config": {
-            "model": args.model,
-            "fourrc_model": args.fourrc_model,
-            "reward_version": "v2_4rc",
-            "num_frames": args.num_frames,
-            "fps": args.fps,
-            "height": args.height,
-            "width": args.width,
-            "num_inference_steps": args.num_inference_steps,
-            "guidance_scale": args.guidance_scale,
-            "flow_shift": args.flow_shift,
-            "offload": args.offload,
-            "max_frames": args.max_frames,
-            "image_size": args.image_size,
-            "static_weight": args.static_weight,
-            "dynamic_weight": args.dynamic_weight,
-            "motion_weight": args.motion_weight,
-        },
-        "candidates": [
-            {"index": i, "reward": r, "is_best": i == best_idx}
-            for i, r in enumerate(rewards)
-        ],
-    }
+    if isinstance(rewards, dict):
+        # Progressive / tree modes return a result_log dict
+        results = rewards
+        results["prompt"] = args.prompt
+        results["image"] = os.path.abspath(args.image)
+        results["total_time_sec"] = total_time
+    else:
+        # Basic sequential BoN returns a list of reward dicts
+        results = {
+            "mode": "bon",
+            "prompt": args.prompt,
+            "image": os.path.abspath(args.image),
+            "N": args.N,
+            "best_seed": best_seed,
+            "total_time_sec": total_time,
+            "config": {
+                "model": args.model,
+                "fourrc_model": args.fourrc_model,
+                "reward_version": "v2_4rc",
+                "num_frames": args.num_frames,
+                "fps": args.fps,
+                "height": args.height,
+                "width": args.width,
+                "num_inference_steps": args.num_inference_steps,
+                "guidance_scale": args.guidance_scale,
+                "flow_shift": args.flow_shift,
+                "offload": args.offload,
+                "max_frames": args.max_frames,
+                "image_size": args.image_size,
+                "static_weight": args.static_weight,
+                "dynamic_weight": args.dynamic_weight,
+                "motion_weight": args.motion_weight,
+            },
+            "candidates": [
+                {"index": i, "reward": r}
+                for i, r in enumerate(rewards)
+            ],
+        }
+
     log_path = os.path.join(case_dir, "rewards.json")
     with open(log_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)

@@ -1,0 +1,354 @@
+"""
+Gradient guidance module for GeoReward V2 (Phase 3) -- Cosmos3 adaptation.
+
+Applies differentiable geometric loss as guidance during the Cosmos3 denoising
+process. The gradient target is explicit geometric consistency -- NOT confidence.
+
+Architecture:
+  1. At selected denoising steps, compute pred_x0 from (latent, v_pred, sigma_t)
+  2. Un-normalize latent, VAE decode under enable_grad -> video frames
+  3. 4RC forward on sampled frames (no @torch.no_grad wrapper)
+  4. Compute geometric loss (L_reproj + L_track_smoothness + L_anchor)
+     conf is detached as valid mask only -- never backprop through confidence
+  5. Backpropagate loss -> grad w.r.t. pred_x0
+  6. Apply WMReward-style normalization to modify v_pred
+
+Key differences from the Wan2.2 version:
+  - Uses Cosmos3's diffusers VAE (AutoencoderKLWan) instead of Wan2.2's custom VAE
+  - VAE decode via un-normalize + vae.decode(z_raw).sample under enable_grad
+  - Config fields: geo_guidance_scale, geo_guidance_frequency
+  - No vae_device_2 split: Cosmos3's VAE runs on a single device
+
+Memory management (multi-GPU mode):
+  3-GPU mode (vae_device + fourrc_device):
+    GPU0: DiT (denoising loop)
+    GPU1: VAE decode (activations stay here)
+    GPU2: 4RC geometric forward + loss + backward
+    Gradient chain crosses devices via differentiable .to() ops.
+
+  2-GPU mode (single guidance_device):
+    GPU0: DiT
+    GPU1: VAE + 4RC
+
+  Single-GPU mode (no device args): works with offload callbacks.
+"""
+
+import warnings
+
+import torch
+import torch.nn.functional as F
+
+from .fourrc_adapter import compute_valid_mask, compute_dynamic_mask, compute_scene_scale
+from .recon_reward import ReconRewardConfig, ReconstructionReward
+
+
+class GeometricGuidance:
+    """
+    Gradient-based geometric guidance for denoising (Cosmos3).
+
+    Modifies v_pred at selected steps to steer latents toward
+    geometrically consistent video generation.
+    """
+
+    def __init__(self, model_4rc, vae, cfg=None, guidance_frames=8,
+                 vae_device=None, fourrc_device=None,
+                 vae_latents_mean=None, vae_latents_inv_std=None):
+        """
+        Args:
+            model_4rc: 4RC (Arc) model, must allow gradient flow.
+            vae: Cosmos3 diffusers VAE (AutoencoderKLWan instance).
+            cfg: ReconRewardConfig with guidance parameters.
+            guidance_frames: Number of frames to sample for guidance (fewer = faster).
+            vae_device: Device where VAE resides (e.g. "cuda:1").
+            fourrc_device: Device where 4RC resides (e.g. "cuda:2").
+            vae_latents_mean: Latent channel means for un-normalization.
+                              Typically from pipe._vae_latents_mean (shape (C,)).
+            vae_latents_inv_std: Latent channel inverse stds for un-normalization.
+                                 Typically from pipe._vae_latents_inv_std (shape (C,)).
+                                 z_raw = z / inv_std + mean
+        """
+        self.model_4rc = model_4rc
+        self.vae = vae
+        self.cfg = cfg or ReconRewardConfig()
+        self.guidance_frames = guidance_frames
+        self.recon_reward = ReconstructionReward(model=model_4rc, cfg=self.cfg)
+
+        # VAE latent normalization parameters
+        # These are used to reverse the normalization: z_raw = z / inv_std + mean
+        self.vae_latents_mean = vae_latents_mean
+        self.vae_latents_inv_std = vae_latents_inv_std
+
+        if vae_device is not None:
+            self.vae_device = torch.device(vae_device)
+        else:
+            self.vae_device = None
+
+        if fourrc_device is not None:
+            self.fourrc_device = torch.device(fourrc_device)
+        elif vae_device is not None:
+            # If only vae_device is given, 4RC runs on the same device
+            self.fourrc_device = torch.device(vae_device)
+        else:
+            self.fourrc_device = None
+
+    def should_guide(self, sigma_t, step_idx):
+        """Check whether guidance should be applied at this noise level and step."""
+        if self.cfg.geo_guidance_frequency <= 0:
+            return False
+        if not (self.cfg.sigma_min < sigma_t < self.cfg.sigma_max):
+            return False
+        if step_idx % self.cfg.geo_guidance_frequency != 0:
+            return False
+        return True
+
+    def guided_v_pred(self, latent, v_pred, sigma_t, step_idx):
+        """
+        Apply geometric guidance to v_pred.
+
+        Called from the denoising loop after CFG but before scheduler.step().
+
+        Args:
+            latent: Current noisy latent (C, T, H, W) -- single candidate.
+            v_pred: Model's velocity prediction (C, T, H, W).
+            sigma_t: Current noise level (scalar).
+            step_idx: Current denoising step index.
+
+        Returns:
+            Modified v_pred with geometric guidance gradient applied,
+            or original v_pred if guidance conditions not met or gradient fails.
+        """
+        if not self.should_guide(sigma_t, step_idx):
+            return v_pred
+
+        # Compute pred_x0: x0 = x_t - sigma_t * v_pred (flow matching formula)
+        # Detach from the denoising graph -- we build a fresh computational graph
+        # from x0_hat through VAE decode -> 4RC -> loss
+        x0_hat = (latent - sigma_t * v_pred).detach().requires_grad_(True)
+
+        try:
+            grad = self._compute_guidance_gradient(x0_hat)
+        except Exception as e:
+            warnings.warn(
+                f"[GeometricGuidance] Gradient computation failed at step {step_idx}: {e}",
+                stacklevel=2,
+            )
+            return v_pred
+
+        if grad is None:
+            return v_pred
+
+        # WMReward-style normalization:
+        # scale = geo_guidance_scale * (||v_pred|| / ||grad||) * (1 - sigma_t^2)
+        scaling_t = 1.0 - sigma_t ** 2
+        norm_ratio = v_pred.norm(2) / (grad.norm(2) + 1e-8)
+        v_guided = v_pred + self.cfg.geo_guidance_scale * norm_ratio * scaling_t * grad
+
+        return v_guided
+
+    def _compute_guidance_gradient(self, x0_hat):
+        """
+        Full forward pass: VAE decode -> sample frames -> 4RC -> geometric loss -> grad.
+
+        In multi-GPU mode, x0_hat is transferred to vae_device for VAE decode,
+        frames are transferred to fourrc_device for 4RC, and the resulting
+        gradient is sent back to x0_hat's original device.
+
+        Returns:
+            Gradient tensor on x0_hat's original device, or None on failure.
+        """
+        src_device = x0_hat.device
+
+        # Transfer x0_hat to VAE device
+        if self.vae_device is not None and self.vae_device != src_device:
+            x0_work = x0_hat.to(self.vae_device).requires_grad_(True)
+        else:
+            x0_work = x0_hat
+
+        # Un-normalize latent: z_raw = z / inv_std + mean
+        # x0_work shape: (C, T, H, W) -- add batch dim for VAE
+        z = x0_work.unsqueeze(0)  # (1, C, T, H, W)
+
+        mean = self.vae_latents_mean
+        inv_std = self.vae_latents_inv_std
+
+        if mean is not None and inv_std is not None:
+            # Ensure correct shape for broadcasting: (1, C, 1, 1, 1)
+            if mean.dim() == 1:
+                mean = mean.view(1, -1, 1, 1, 1)
+            elif mean.dim() != 5:
+                mean = mean.view(1, -1, 1, 1, 1)
+            if inv_std.dim() == 1:
+                inv_std = inv_std.view(1, -1, 1, 1, 1)
+            elif inv_std.dim() != 5:
+                inv_std = inv_std.view(1, -1, 1, 1, 1)
+
+            mean = mean.to(device=z.device, dtype=z.dtype)
+            inv_std = inv_std.to(device=z.device, dtype=z.dtype)
+
+            z_raw = z / inv_std + mean
+        else:
+            z_raw = z
+
+        # VAE decode under enable_grad (AutoencoderKLWan.decode may have @torch.no_grad)
+        with torch.enable_grad():
+            video = self.vae.decode(z_raw).sample  # (B, C, T, H, W) in [-1, 1]
+
+        if video is None:
+            return None
+
+        # Remove batch dim: (C, T, H, W)
+        video = video.squeeze(0)
+
+        # Sample frames uniformly
+        T = video.shape[1]
+        n = max(1, min(self.guidance_frames, T))
+        indices = torch.linspace(0, T - 1, n).long()
+        frames = video[:, indices]  # (3, n, H, W) -- on vae_device
+
+        # Prepare 4RC input views (differentiable)
+        # frames are transferred to fourrc_device inside _prepare_views
+        views = self._prepare_views(frames)
+
+        # 4RC forward -- bypass inference() which has @torch.no_grad.
+        # Call loss_of_one_batch() directly with enable_grad.
+        from .fourrc_adapter import _ensure_4rc_importable
+        _ensure_4rc_importable()
+
+        from arc.dust3r.inference_multiview import loss_of_one_batch
+        from arc.dust3r.utils.device import collate_with_cat
+
+        device_4rc = self.fourrc_device or next(self.model_4rc.parameters()).device
+        batch = collate_with_cat([tuple(views)])
+
+        with torch.enable_grad():
+            result = loss_of_one_batch(
+                batch, self.model_4rc, None, device_4rc, "bf16-mixed",
+            )
+
+        preds = result["preds"]
+        N_frames = len(preds)
+
+        # Extract outputs (keeping gradient flow through pts and track)
+        pts_list = []
+        track_list = []
+        ext_list = []
+        int_list = []
+        conf_list = []
+        conf_track_list = []
+
+        for i in range(N_frames):
+            pred = preds[i]
+            pts_list.append(pred["pts"].squeeze(0))
+            track_list.append(pred["track"].squeeze(0))
+            ext_list.append(pred["extrinsic"])
+            int_list.append(pred["intrinsic"])
+            conf_list.append(pred["conf"].squeeze(0))
+            conf_track_list.append(pred["conf_track"].squeeze(0))
+
+        pts = torch.stack(pts_list)
+        track_abs = torch.stack(track_list)
+        extrinsics = torch.stack(ext_list)
+        intrinsics = torch.stack(int_list)
+        conf = torch.stack(conf_list)
+        conf_track = torch.stack(conf_track_list)
+
+        # Convert track to relative displacement (same as fourrc_adapter)
+        track = track_abs - pts[0].unsqueeze(0)
+
+        # Compute masks (detached -- no gradient through conf)
+        with torch.no_grad():
+            valid_geo, valid_track = compute_valid_mask(
+                conf, conf_track, quantile=self.cfg.conf_valid_quantile
+            )
+            scene_scale = compute_scene_scale(pts, extrinsic_frame0=extrinsics[0])
+            _, dynamic_mask = compute_dynamic_mask(
+                track.detach(),
+                threshold_ratio=self.cfg.dynamic_threshold_ratio,
+                scene_scale=scene_scale,
+            )
+
+        # Compute differentiable loss
+        structured_output = {
+            "pts": pts,
+            "track": track,
+            "extrinsic": extrinsics,
+            "intrinsic": intrinsics,
+        }
+
+        loss = self.recon_reward.compute_differentiable_loss(
+            structured_output, valid_geo, dynamic_mask, scene_scale
+        )
+
+        # Backprop to x0_work
+        grad_on_device = torch.autograd.grad(loss, x0_work, retain_graph=False)[0]
+
+        # Transfer gradient back to source device if needed
+        if self.vae_device is not None and self.vae_device != src_device:
+            return grad_on_device.to(src_device)
+        return grad_on_device
+
+    def _prepare_views(self, frames):
+        """
+        Prepare frames as 4RC views while maintaining gradient flow.
+
+        Frames are resized/cropped on their current device, then transferred
+        to fourrc_device (if set) for 4RC forward. The .to() is differentiable.
+
+        Args:
+            frames: (3, N, H, W) tensor in [-1, 1].
+
+        Returns:
+            List of view dicts with 'img' as differentiable tensors on fourrc_device.
+        """
+        import numpy as np
+
+        N = frames.shape[1]
+        target_size = max(self.cfg.image_size, 14)
+        patch_size = 14
+
+        views = []
+        for i in range(N):
+            frame = frames[:, i]  # (3, H, W)
+            H_in, W_in = frame.shape[1], frame.shape[2]
+
+            # Resize to target size (differentiable bilinear interpolation)
+            scale = target_size / max(H_in, W_in)
+            new_H = max(patch_size, int(round(H_in * scale)))
+            new_W = max(patch_size, int(round(W_in * scale)))
+            frame_resized = F.interpolate(
+                frame.unsqueeze(0), size=(new_H, new_W),
+                mode='bilinear', align_corners=False
+            ).squeeze(0)  # (3, new_H, new_W)
+
+            # Crop to patch-aligned size (center crop)
+            cx, cy = new_W // 2, new_H // 2
+            halfw = ((2 * cx) // patch_size) * patch_size // 2
+            halfh = ((2 * cy) // patch_size) * patch_size // 2
+
+            # Guard: ensure at least one patch
+            if halfw < patch_size // 2 or halfh < patch_size // 2:
+                halfw = max(halfw, patch_size // 2)
+                halfh = max(halfh, patch_size // 2)
+                # Ensure indices stay in bounds
+                halfw = min(halfw, cx, new_W - cx)
+                halfh = min(halfh, cy, new_H - cy)
+
+            frame_cropped = frame_resized[
+                :,
+                cy - halfh: cy + halfh,
+                cx - halfw: cx + halfw,
+            ]  # (3, H_crop, W_crop)
+
+            # Transfer to 4RC device (differentiable -- autograd tracks cross-device copy)
+            if self.fourrc_device is not None:
+                frame_cropped = frame_cropped.to(self.fourrc_device)
+
+            H_out, W_out = frame_cropped.shape[1], frame_cropped.shape[2]
+
+            views.append({
+                "img": frame_cropped.unsqueeze(0),  # (1, 3, H, W)
+                "true_shape": np.int32([[H_out, W_out]]),
+                "idx": i,
+                "instance": str(i),
+            })
+        return views
