@@ -93,24 +93,6 @@ def main():
     from diffusers import Cosmos3OmniPipeline
     from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 
-    # ⚠️ Monkey patch: 禁用 Guardrail 加载
-    import os
-    os.environ['HF_HUB_OFFLINE'] = '0'  # 先取消离线模式
-
-    # Patch Cosmos3OmniPipeline 的 from_pretrained 方法
-    original_from_pretrained = Cosmos3OmniPipeline.from_pretrained
-
-    @classmethod
-    def patched_from_pretrained(cls, *args, **kwargs):
-        # 强制禁用 safety_checker
-        kwargs['safety_checker'] = None
-        # 禁用 Guardrail 相关组件
-        if 'load_safety_checker' in kwargs:
-            kwargs['load_safety_checker'] = False
-        return original_from_pretrained(*args, **kwargs)
-
-    Cosmos3OmniPipeline.from_pretrained = patched_from_pretrained
-
     from VGGTomega_Cotracker3.bon_pipeline_vggt import GeoRewardBoNVGGT
     from VGGTomega_Cotracker3.recon_reward_vggt import VGGTReconRewardConfig
     from VGGTomega_Cotracker3.utils import save_video_from_pil
@@ -126,9 +108,11 @@ def main():
     pipe = Cosmos3OmniPipeline.from_pretrained(
         args.model,
         torch_dtype=torch.bfloat16,  # ← 使用 bfloat16
-        safety_checker=None,  # ← 禁用 safety_checker 避免下载 Guardrail
     )
     pipe = pipe.to("cuda")
+
+    # ✅ 加载后再禁用 safety_checker（避免下载 Guardrail）
+    pipe.safety_checker = None
 
     # ✅ flow_shift 在 scheduler 上设置
     pipe.scheduler = UniPCMultistepScheduler.from_config(
