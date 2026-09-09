@@ -107,6 +107,7 @@ def main():
     pipe = Cosmos3OmniPipeline.from_pretrained(
         args.model,
         torch_dtype=torch.bfloat16,  # ← 使用 bfloat16，与现有代码一致
+        safety_checker=None,  # ← 禁用 safety_checker 避免下载 Guardrail
     )
     pipe = pipe.to("cuda")
 
