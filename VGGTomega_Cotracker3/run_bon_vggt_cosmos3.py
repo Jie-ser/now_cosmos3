@@ -92,6 +92,25 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # ⚠️ 必须在导入 Cosmos3OmniPipeline 之前 mock cosmos_guardrail
+    import sys
+    import types
+    import importlib.machinery
+
+    # Mock cosmos_guardrail 模块以避免下载 gated Cosmos-1.0-Guardrail
+    mock = types.ModuleType("cosmos_guardrail")
+    mock.__spec__ = importlib.machinery.ModuleSpec("cosmos_guardrail", None)
+    mock.__version__ = "0.0.0"
+
+    class _NoOpSafetyChecker:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __call__(self, *args, **kwargs):
+            return args[0] if args else None
+
+    mock.CosmosSafetyChecker = _NoOpSafetyChecker
+    sys.modules["cosmos_guardrail"] = mock
+
     # 延迟导入（避免 --help 时加载依赖）
     import torch
     from PIL import Image
