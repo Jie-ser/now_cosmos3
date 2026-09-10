@@ -126,11 +126,9 @@ def main():
     logger.info(f"加载 Cosmos3 模型: {args.model}")
     pipe = Cosmos3OmniPipeline.from_pretrained(
         args.model,
-        torch_dtype=torch.bfloat16,  # ← 使用 bfloat16
+        torch_dtype=torch.bfloat16,
+        device_map="cuda",
     )
-    pipe = pipe.to("cuda")
-
-    # ✅ 加载后再禁用 safety_checker（避免下载 Guardrail）
     pipe.safety_checker = None
 
     # ✅ flow_shift 在 scheduler 上设置
