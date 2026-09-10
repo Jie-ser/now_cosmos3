@@ -205,10 +205,8 @@ class GeoRewardBoNVGGT:
         if not candidates:
             raise RuntimeError("所有候选生成失败。")
 
-        # ===== 阶段 2: 卸载 DiT+VAE，加载评分模型 =====
-        print(f"\n[BoNVGGT] 卸载 DiT+VAE，加载 VGGT-Omega + CoTracker3...")
-        self._offload_dit()
-        self._offload_vae()
+        # ===== 阶段 2: 加载评分模型 =====
+        print(f"\n[BoNVGGT] 加载 VGGT-Omega + CoTracker3...")
         self._load_reward_models()
 
         # ===== 阶段 3: 评分 =====
